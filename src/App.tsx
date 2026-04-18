@@ -2,16 +2,43 @@ import React, { useState, useEffect, useRef } from 'react';
 import Editor from "@monaco-editor/react";
 import { 
   Zap, Code, Terminal as TerminalIcon, Bot, BookOpen, Layers, Rocket, 
-  Search, Download, Share2, Play, Plus, X, Command, Globe, Github
+  Search, Download, Share2, Play, Plus, X, Command, Globe, Github, Smartphone, Monitor, Save, MousePointer2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { debugCode } from './services/geminiService';
+import { debugCode, cloneWebsite, getCloneSuggestions } from './services/geminiService';
+
+// Capacitor & Storage
+import { Device } from '@capacitor/device';
+import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
+import Dexie, { type Table } from 'dexie';
+
+// --- Database Configuration ---
+class QamaniDB extends Dexie {
+  files!: Table<ProjectFile>;
+
+  constructor() {
+    super('QamaniSovereignDB');
+    this.version(1).stores({
+      files: '++id, name, language, isCloned'
+    });
+  }
+}
+
+const db = new QamaniDB();
 
 // --- Types ---
 type TerminalTab = {
   id: string;
   title: string;
   history: string[];
+};
+
+type ProjectFile = {
+  id?: string;
+  name: string;
+  content: string;
+  language: string;
+  isCloned?: boolean;
 };
 
 type Package = {
@@ -24,33 +51,34 @@ type Package = {
 // --- Components ---
 
 const SplashScreen = () => (
-  <div className="fixed inset-0 bg-background flex flex-col items-center justify-center z-[100]">
+  <div className="fixed inset-0 bg-[#050507] flex flex-col items-center justify-center z-[100] overflow-hidden">
+    <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_#4c1d95_0%,_transparent_70%)] opacity-30"></div>
     <motion.div 
       initial={{ scale: 0.8, opacity: 0 }}
       animate={{ scale: [0.8, 1.1, 1], opacity: 1 }}
       transition={{ duration: 1.5, repeat: Infinity, repeatType: "mirror" }}
-      className="text-6xl font-extrabold font-display text-cosmic-blue drop-shadow-[0_0_15px_rgba(59,130,246,0.6)] uppercase tracking-tighter"
+      className="text-6xl sm:text-8xl font-black font-display text-text drop-shadow-[0_0_20px_rgba(34,211,238,0.5)] uppercase italic tracking-tighter z-10"
     >
       QAMANIOID3
     </motion.div>
-    <div className="mt-8 flex gap-2">
-      <div className="w-2 h-2 bg-cyber-cyan rounded-full animate-bounce delay-75"></div>
-      <div className="w-2 h-2 bg-cyber-cyan rounded-full animate-bounce delay-150"></div>
-      <div className="w-2 h-2 bg-cyber-cyan rounded-full animate-bounce delay-300"></div>
+    <div className="mt-12 flex gap-4 z-10">
+      <div className="w-3 h-3 bg-cyber-cyan border border-white/20 rounded-full animate-ping"></div>
+      <div className="w-3 h-3 bg-cosmic-blue border border-white/20 rounded-full animate-ping delay-150"></div>
+      <div className="w-3 h-3 bg-deep-purple border border-white/20 rounded-full animate-ping delay-300"></div>
     </div>
-    <p className="mt-4 text-muted text-xs uppercase tracking-widest font-mono">Initializing Imperial Core v2.0</p>
+    <p className="mt-8 text-cyber-cyan text-sm uppercase tracking-[0.5em] font-mono animate-pulse">Initializing Imperial Core v3.0</p>
   </div>
 );
 
 const KeyboardToolbar = ({ onInsert }: { onInsert: (s: string) => void }) => {
-  const symbols = ['(', ')', ':', '[', ']', '{', '}', '=', '+', '"', "'", '.', ',', '#', '$', '|', '>', '_'];
+  const symbols = ['(', ')', ':', '[', ']', '{', '}', '=', '+', '"', "'", '.', ',', '#', '$', '|', '>', '_', '/', '\\'];
   return (
-    <div className="flex bg-card-background border-t border-border overflow-x-auto p-2 gap-2 scrollbar-hide shrink-0">
+    <div className="flex bg-black/80 border-t border-white/5 overflow-x-auto p-4 gap-3 scrollbar-hide shrink-0 backdrop-blur-xl">
       {symbols.map(s => (
         <button 
           key={s} 
           onClick={() => onInsert(s)} 
-          className="px-4 py-1.5 bg-background border border-border rounded-md text-text hover:bg-cosmic-blue hover:border-cyber-cyan transition-all font-mono min-w-[44px] text-sm"
+          className="px-6 py-3 bg-white/5 border border-white/10 rounded-xl text-text hover:bg-cosmic-blue hover:text-white hover:border-cyber-cyan transition-all font-mono min-w-[56px] text-lg active:scale-90 shadow-lg"
         >
           {s}
         </button>
@@ -59,50 +87,188 @@ const KeyboardToolbar = ({ onInsert }: { onInsert: (s: string) => void }) => {
   );
 };
 
+// --- Qamani Language Definitions ---
+const qamaniKeywords = {
+   اطبع: 'print',
+   إذا: 'if',
+   وإلا: 'else',
+   كرر: 'for',
+   بينما: 'while',
+   عرف: 'def',
+   رجع: 'return',
+   استورد: 'import',
+   من: 'from',
+   ك: 'as',
+   صحيح: 'True',
+   خطأ: 'False',
+   ليس: 'None',
+   في: 'in',
+   جرب: 'try',
+   أمسك: 'except',
+   نهائياً: 'finally'
+};
+
+const transpileQamani = (source: string) => {
+  let pyCode = source;
+  // Replace keywords (sorted by length descending to avoid partial matches)
+  const sortedKeywords = Object.keys(qamaniKeywords).sort((a, b) => b.length - a.length);
+  sortedKeywords.forEach(qKey => {
+    const pyKey = qamaniKeywords[qKey as keyof typeof qamaniKeywords];
+    const regex = new RegExp(qKey, 'g');
+    pyCode = pyCode.replace(regex, pyKey);
+  });
+  return pyCode;
+};
+
 // --- Main Application ---
 
 export default function App() {
   const [stage, setStage] = useState<'splash' | 'landing' | 'ide'>('splash');
   const [activeSidebar, setActiveSidebar] = useState<'files' | 'pip' | 'ai'>('files');
-  const [code, setCode] = useState("import os\nimport sys\n\ndef main():\n    print('Welcome to QAMANIOID3 Terminal Environment')\n    print(f'Python version: {sys.version}')\n\nif __name__ == '__main__':\n    main()");
+  
+  // Dynamic File State
+  const [files, setFiles] = useState<ProjectFile[]>([]);
+  const [activeFileId, setActiveFileId] = useState<string>('');
+  const [isKeyboardVisible, setIsKeyboardVisible] = useState(false);
+
   const [isDebugging, setIsDebugging] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
+  const [platformInfo, setPlatformInfo] = useState<{ platform: string; isTouch: boolean }>({ platform: 'web', isTouch: false });
+  const [isPyodideLoading, setIsPyodideLoading] = useState(true);
+  const pyodideRef = useRef<any>(null);
+
+  const activeFile = files.find(f => f.id === activeFileId) || files[0] || { id: 'temp', name: 'main.py', content: '', language: 'python' };
+  const code = activeFile.content;
+
+  const setCode = (value: string | ((prev: string) => string)) => {
+    setFiles(prev => prev.map(f => {
+      if (f.id === activeFileId) {
+        const newContent = typeof value === 'function' ? value(f.content) : value;
+        return { ...f, content: newContent };
+      }
+      return f;
+    }));
+  };
+
+  // Sync with IndexedDB
+  useEffect(() => {
+    const loadFromDB = async () => {
+      const allFiles = await db.files.toArray();
+      if (allFiles.length > 0) {
+        setFiles(allFiles);
+        setActiveFileId(allFiles[0].id!);
+      } else {
+        const defaultFiles: ProjectFile[] = [
+          { name: 'ترحيب.qmani', language: 'qamani', content: "عرف الرئيسية():\n    اطبع('مرحباً بك في لغة قماني الأولى')\n    اطبع('هذه البداية لعصر جديد')\n\nالرئيسية()" },
+          { name: 'main.py', language: 'python', content: "import os\nimport sys\n\ndef main():\n    print('Welcome to QAMANIOID3 Sovereign v3.0')\n    print(f'Kernel: {sys.platform}')\n\nif __name__ == '__main__':\n    main()" },
+          { name: 'utils.py', language: 'python', content: "def help():\n    print('Imperial assistance ready.')" }
+        ];
+        const ids = await db.files.bulkAdd(defaultFiles, { allKeys: true });
+        const createdFiles = defaultFiles.map((f, i) => ({ ...f, id: String(ids[i]) }));
+        setFiles(createdFiles);
+        setActiveFileId(createdFiles[0].id!);
+      }
+    };
+    loadFromDB();
+  }, []);
+
+  // Autosave Logic
+  useEffect(() => {
+    const timer = setTimeout(async () => {
+      if (activeFile && activeFile.id && activeFile.id !== 'temp') {
+        await db.files.update(String(activeFile.id), { content: code });
+        console.debug("Autosaved to SovereignDB.");
+      }
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [code, activeFileId]);
 
   // Terminal State
   const [terminalTabs, setTerminalTabs] = useState<TerminalTab[]>([
-    { id: 'tab-1', title: 'bash', history: ['QAMANIOID3 OS [Version 2.0.4] ready...', 'Type "help" for commands.'] }
+    { id: 'tab-1', title: 'bash', history: ['QAMANIOID3 Sovereign [Kernel v3.1] calibration...', 'Neural Link established. Standby for Pyodide...'] }
   ]);
   const [activeTerminalId, setActiveTerminalId] = useState('tab-1');
   const [terminalInput, setTerminalInput] = useState("");
   const terminalBottomRef = useRef<HTMLDivElement>(null);
 
-  // PIP Manager State
-  const [searchQuery, setSearchQuery] = useState("");
-  const [installingPack, setInstallingPack] = useState<string | null>(null);
-  const [progress, setProgress] = useState(0);
-  const [availablePackages] = useState<Package[]>([
-    { name: 'NumPy', version: '1.24.3', description: 'Fundamental package for scientific computing.', installed: true },
-    { name: 'Pandas', version: '2.0.2', description: 'Data analysis and manipulation library.', installed: true },
-    { name: 'TensorFlow', version: '2.12.0', description: 'End-to-end open source platform for ML.', installed: false },
-    { name: 'PyTorch', version: '2.0.1', description: 'Tensors and Dynamic neural networks with strong GPU acceleration.', installed: false },
-    { name: 'Requests', version: '2.31.0', description: 'Elegant and simple HTTP library for Python.', installed: false },
-    { name: 'Flask', version: '2.3.2', description: 'Lightweight WSGI web application framework.', installed: false },
-    { name: 'OpenCV', version: '4.8.0', description: 'Open Source Computer Vision Library.', installed: false },
-  ]);
+  const addLogToActiveTerminal = (msg: string) => {
+    setTerminalTabs(prev => {
+      const next = [...prev];
+      const idx = next.findIndex(t => t.id === activeTerminalId);
+      if (idx !== -1) {
+        next[idx].history.push(msg);
+      }
+      return next;
+    });
+  };
 
+  // Initialize Pyodide with hardened path
   useEffect(() => {
+    const initPyodide = async () => {
+      try {
+        // @ts-ignore
+        if (typeof window !== 'undefined' && window.loadPyodide) {
+          // @ts-ignore
+          const pyodide = await window.loadPyodide({
+            indexURL: "https://cdn.jsdelivr.net/pyodide/v0.26.1/full/"
+          });
+          pyodide.setStderr({ batched: (s: string) => console.debug("Core Log:", s) });
+          pyodideRef.current = pyodide;
+          setIsPyodideLoading(false);
+          addLogToActiveTerminal('Neural Engine: CALIBRATED [PYTHONHOME=/]');
+        }
+      } catch (e) {
+        addLogToActiveTerminal('Error: Imperial Engine failed calibration.');
+      }
+    };
+    initPyodide();
+  }, []);
+
+  // Platform & UI Adjustments
+  useEffect(() => {
+    const checkEnv = async () => {
+      const info = await Device.getInfo();
+      const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+      setPlatformInfo({ platform: info.platform, isTouch });
+      
+      // Detection for virtual keyboard (simple resize detection)
+      const detectKeyboard = () => {
+        setIsKeyboardVisible(window.innerHeight < 500);
+      };
+      window.addEventListener('resize', detectKeyboard);
+      return () => window.removeEventListener('resize', detectKeyboard);
+    };
+    checkEnv();
     const timer = setTimeout(() => setStage('landing'), 3500);
     return () => clearTimeout(timer);
   }, []);
 
+  // Desktop Shortcuts
   useEffect(() => {
-    terminalBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [terminalTabs]);
+    const handleKeys = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        switch (e.key.toLowerCase()) {
+          case 's':
+            e.preventDefault();
+            addLogToActiveTerminal('System: [MANUAL_SAVE_COMPLETE] Snapshot stored in SovereignDB.');
+            break;
+          case 'r':
+            e.preventDefault();
+            handleRunCode();
+            break;
+          case 'f':
+            e.preventDefault();
+            setActiveSidebar('pip');
+            break;
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeys);
+    return () => window.removeEventListener('keydown', handleKeys);
+  }, [code, isPyodideLoading, activeFileId]);
 
-  const insertCodeSymbol = (symbol: string) => setCode(prev => prev + symbol);
-
-  // Simulated Terminal Logic
-  const executeTerminalCommand = (cmd: string) => {
+  // Terminal Execution Engine
+  const executeTerminalCommand = async (cmd: string) => {
     const newTabs = [...terminalTabs];
     const tabIndex = newTabs.findIndex(t => t.id === activeTerminalId);
     if (tabIndex === -1) return;
@@ -115,39 +281,74 @@ export default function App() {
 
     switch (command) {
       case 'help':
-        history.push('Available commands: ls, cd, mkdir, pip, python, clear, date, whoami, help');
+        history.push('Sovereign CLI: qamani, ls, python, save, clear, info, help');
+        break;
+      case 'info':
+        history.push(`Platform: ${platformInfo.platform} | Engine: Pyodide WASM`);
+        history.push(`Storage: IndexedDB (Persistent) | Bridge: ${isPyodideLoading ? 'Syncing' : 'Connected'}`);
         break;
       case 'ls':
-        history.push('main.py  utils.py  requirements.txt  src/');
+        files.forEach(f => history.push(`- ${f.name} (${f.isCloned ? 'Mirror' : 'Native'})`));
         break;
       case 'clear':
         history.length = 0;
-        history.push('Terminal cleared.');
-        break;
-      case 'date':
-        history.push(new Date().toString());
-        break;
-      case 'whoami':
-        history.push('imperial_developer');
+        history.push('Memory sanitized.');
         break;
       case 'python':
-        if (parts[1] === 'main.py') {
-          history.push('Running main.py...');
-          history.push('Welcome to QAMANIOID3 Terminal Environment');
-          history.push('Python version: 3.11.0 (Imperial build)');
+        if (parts[1]) {
+          const targetFile = files.find(f => f.name === parts[1]);
+          if (!targetFile) {
+            history.push(`Error: File ${parts[1]} not found in local workspace.`);
+            break;
+          }
+          if (isPyodideLoading || !pyodideRef.current) {
+            history.push('Wait: Neural Engine is warming up...');
+          } else {
+            history.push(`[EXECUTE] Mirroring logic from ${targetFile.name}...`);
+            try {
+              pyodideRef.current.setStdout({ batched: (s: string) => addLogToActiveTerminal(s) });
+              pyodideRef.current.setStderr({ batched: (s: string) => addLogToActiveTerminal(s) });
+              
+              let executionCode = targetFile.content;
+              if (targetFile.language === 'qamani' || targetFile.name.endsWith('.qmani')) {
+                 history.push('[TRANSPILER] Converting Qamani Arabic logic to Imperial Python...');
+                 executionCode = transpileQamani(targetFile.content);
+              }
+
+              await pyodideRef.current.loadPackagesFromImports(executionCode);
+              const result = await pyodideRef.current.runPythonAsync(executionCode);
+              if (result !== undefined && result !== null) history.push(String(result));
+            } catch (err: any) {
+              history.push(`Logic Error: ${err.message}`);
+            }
+          }
         } else {
-          history.push('Python 3.11.0 (Imperial) - Type "exit()" to quit.');
+          history.push('Python 3.11.0 (QAMANI Sovereign) - WASM Core.');
         }
         break;
-      case 'pip':
-        if (parts[1] === 'install') {
-          history.push(`Searching for ${parts[2]}...`);
-          history.push(`Successfully installed ${parts[2]}-latest`);
+      case 'qamani':
+        if (parts[1] === 'clone' && parts[2]) {
+          const url = parts[2];
+          history.push(`[MIRROR] Initiating architectural extraction of ${url}...`);
+          try {
+            const data = await cloneWebsite(url);
+            const fileName = `cloned_${url.replace(/https?:\/\/|www\./g, '').split('/')[0]}.html`;
+            const pyName = `automation_${url.replace(/https?:\/\/|www\./g, '').split('/')[0]}.py`;
+            const id1 = await db.files.add({ name: fileName, language: 'html', content: data.html, isCloned: true });
+            const id2 = await db.files.add({ name: pyName, language: 'python', content: data.python, isCloned: true });
+            
+            const newF1: ProjectFile = { id: String(id1), name: fileName, language: 'html', content: data.html, isCloned: true };
+            const newF2: ProjectFile = { id: String(id2), name: pyName, language: 'python', content: data.python, isCloned: true };
+            
+            setFiles(prev => [...prev, newF1, newF2]);
+            setActiveFileId(String(id1));
+            history.push(`[SUCCESS] Architectural mirror of ${url} stored.`);
+          } catch (e) {
+            history.push(`[FAILURE] Link breakage during mirror process.`);
+          }
         } else {
-          history.push('pip 23.1.2 - Usage: pip install <package>');
+          history.push('Usage: qamani clone [URL]');
         }
-        break;
-      case '':
         break;
       default:
         history.push(`bash: ${command}: command not found`);
@@ -159,80 +360,86 @@ export default function App() {
   };
 
   const handleRunCode = () => {
-    executeTerminalCommand('python main.py');
+    const name = activeFile.name;
+    executeTerminalCommand(`python ${name}`);
   };
 
-  const addTerminalTab = () => {
-    const newId = `tab-${Date.now()}`;
-    setTerminalTabs([...terminalTabs, { id: newId, title: 'bash', history: [`Session ${terminalTabs.length + 1} started.`] }]);
-    setActiveTerminalId(newId);
+  const handleEditorWillMount = (monaco: any) => {
+    // Register Qamani language
+    monaco.languages.register({ id: 'qamani' });
+    monaco.languages.setMonarchTokensProvider('qamani', {
+      tokenizer: {
+        root: [
+          [new RegExp(Object.keys(qamaniKeywords).join('|')), 'keyword'],
+          [/\d+/, 'number'],
+          [/"[^"]*"/, 'string'],
+          [/'[^']*'/, 'string'],
+          [/#.*$/, 'comment'],
+        ]
+      }
+    });
+    monaco.languages.setLanguageConfiguration('qamani', {
+      comments: { lineComment: '#' },
+      brackets: [['(', ')'], ['{', '}'], ['[', ']']],
+      autoClosingPairs: [
+        { open: '{', close: '}' },
+        { open: '[', close: ']' },
+        { open: '(', close: ')' },
+        { open: '"', close: '"' },
+        { open: "'", close: "'" },
+      ]
+    });
   };
 
-  const removeTerminalTab = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (terminalTabs.length === 1) return;
-    const newTabs = terminalTabs.filter(t => t.id !== id);
-    setTerminalTabs(newTabs);
-    if (activeTerminalId === id) setActiveTerminalId(newTabs[0].id);
+  const handleFileDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (file) {
+      const text = await file.text();
+      const name = file.name;
+      const lang = name.endsWith('.py') ? 'python' : name.endsWith('.html') ? 'html' : 'plaintext';
+      const id = await db.files.add({ name, language: lang, content: text });
+      setFiles(prev => [...prev, { id: String(id), name, language: lang, content: text }]);
+      setActiveFileId(String(id));
+      addLogToActiveTerminal(`[IMPORT] File ${name} assimilated into workspace.`);
+    }
   };
 
-  const handleInstallPackage = (name: string) => {
-    setInstallingPack(name);
-    setProgress(0);
-    const interval = setInterval(() => {
-      setProgress(old => {
-        if (old >= 100) {
-          clearInterval(interval);
-          setInstallingPack(null);
-          executeTerminalCommand(`pip install ${name}`);
-          return 100;
-        }
-        return old + 5;
-      });
-    }, 100);
-  };
-
-  const handleShare = () => {
-    setIsSharing(true);
-    setTimeout(() => {
-      setIsSharing(false);
-      alert("Link copied: https://qamanioid3.io/share/" + Math.random().toString(36).substring(7));
-    }, 1500);
-  };
+  useEffect(() => {
+    terminalBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [terminalTabs]);
 
   if (stage === 'splash') return <SplashScreen />;
 
   if (stage === 'landing') {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center bg-background text-text font-sans p-6 overflow-hidden relative">
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_#4c1d95,_transparent_70%)] opacity-20"></div>
-        <div className="absolute top-0 left-0 w-full h-full pointer-events-none">
-          {[...Array(30)].map((_, i) => (
-            <div key={i} className="absolute bg-white rounded-full opacity-10 animate-pulse"
-              style={{ top: `${Math.random() * 100}%`, left: `${Math.random() * 100}%`, width: `${Math.random() * 2}px`, height: `${Math.random() * 2}px`, animationDelay: `${Math.random() * 5}s` }}
-            />
-          ))}
-        </div>
-        
+      <div className="min-h-screen flex flex-col items-center justify-center bg-[#050507] text-text font-sans p-6 overflow-hidden relative">
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_#4c1d95_0%,_transparent_70%)] opacity-20 animate-pulse"></div>
         <motion.div initial={{ y: 20, opacity: 0 }} animate={{ y: 0, opacity: 1 }} className="z-10 text-center max-w-2xl px-4">
-          <div className="flex justify-center mb-6">
-            <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-deep-purple via-cosmic-blue to-cyber-cyan flex items-center justify-center shadow-2xl shadow-cosmic-blue/20">
-              <Code size={48} className="text-white" />
+          <div className="flex justify-center mb-10">
+            <div className="w-24 h-24 rounded-3xl bg-gradient-to-br from-deep-purple via-cosmic-blue to-cyber-cyan flex items-center justify-center shadow-[0_0_60px_rgba(59,130,246,0.5)]">
+              <Code size={56} className="text-white" />
             </div>
           </div>
-          <h1 className="text-5xl sm:text-7xl font-extrabold font-display text-text mb-4 tracking-tighter uppercase italic">
+          <h1 className="text-6xl sm:text-8xl font-black font-display text-text mb-6 tracking-tighter uppercase italic drop-shadow-[0_0_10px_rgba(255,255,255,0.2)]">
             Qamanioid3
           </h1>
-          <p className="text-cyber-cyan text-xl font-display mb-8 tracking-[0.3em] uppercase opacity-80">Codex Imperium</p>
-          <p className="text-muted text-lg mb-12 leading-relaxed">
-            The world's most advanced Android Python IDE. Linux terminal, smart package management, and AI debugging - all in your pocket.
-          </p>
+          <p className="text-cyber-cyan text-xl sm:text-2xl font-display mb-12 tracking-[0.5em] uppercase opacity-90 border-b-2 border-cyber-cyan inline-block pb-2">Universal Sovereign</p>
+          
+          <div className="flex flex-wrap items-center justify-center gap-8 mb-16 text-xs uppercase tracking-widest bg-white/5 backdrop-blur-md rounded-2xl p-6 border border-white/10 text-muted">
+             <div className="flex items-center gap-3"><Monitor size={18} className="text-cyber-cyan"/> Windows</div>
+             <div className="w-[1px] h-4 bg-white/20"></div>
+             <div className="flex items-center gap-3"><Smartphone size={18} className="text-deep-purple"/> Android/iOS</div>
+             <div className="w-[1px] h-4 bg-white/20"></div>
+             <div className="flex items-center gap-3"><Zap size={18} className="text-matrix-green"/> Offline WASM</div>
+          </div>
+
           <button 
             onClick={() => setStage('ide')} 
-            className="group relative px-12 py-5 bg-transparent border-2 border-cyber-cyan text-cyber-cyan rounded-full font-display text-2xl hover:bg-cyber-cyan hover:text-background transition-all duration-500 backdrop-blur-md shadow-[0_0_30px_rgba(34,211,238,0.2)] hover:shadow-[0_0_50px_rgba(34,211,238,0.4)]"
+            className="group relative px-16 py-6 bg-white/5 border border-cyber-cyan/50 text-cyber-cyan rounded-full font-display text-2xl hover:bg-cyber-cyan hover:text-background transition-all duration-500 backdrop-blur-xl shadow-[0_0_40px_rgba(34,211,238,0.2)] hover:shadow-[0_0_60px_rgba(34,211,238,0.5)]"
           >
             <span className="relative z-10 flex items-center gap-4">
-              Launch Terminal <Rocket size={28} className="group-hover:translate-x-1 group-hover:-translate-y-1 transition-transform"/>
+              Enter Sovereign Base <Rocket size={32} className="group-hover:translate-x-1 group-hover:-translate-y-1 transition-transform"/>
             </span>
           </button>
         </motion.div>
@@ -241,262 +448,204 @@ export default function App() {
   }
 
   return (
-    <div className="h-screen flex flex-col bg-background text-text selection:bg-cosmic-blue/30 overflow-hidden font-sans">
-      {/* --- Top Navbar --- */}
-      <header className="h-14 border-b border-border flex items-center justify-between px-4 bg-card-background/80 backdrop-blur-lg sticky top-0 z-50 shrink-0">
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2 group cursor-pointer" onClick={() => setStage('landing')}>
-            <div className="w-8 h-8 rounded bg-gradient-to-br from-deep-purple to-cosmic-blue flex items-center justify-center font-bold text-white shadow-lg">Q</div>
-            <h1 className="text-lg font-bold font-display text-text hidden sm:block uppercase tracking-widest group-hover:text-cyber-cyan transition-colors">QAMANIOID3</h1>
+    <div 
+      className="h-screen flex flex-col bg-[#050507] text-text selection:bg-cosmic-blue/30 overflow-hidden font-sans"
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={handleFileDrop}
+    >
+      {/* Top Navbar */}
+      <header className="h-16 border-b border-white/5 flex items-center justify-between px-6 bg-black/60 backdrop-blur-2xl sticky top-0 z-50 shrink-0">
+        <div className="flex items-center gap-6">
+          <div className="flex items-center gap-3 group cursor-pointer" onClick={() => setStage('landing')}>
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-deep-purple to-cosmic-blue flex items-center justify-center font-black text-white shadow-xl shadow-cosmic-blue/20">Q</div>
+            <h1 className="text-xl font-black font-display text-text hidden sm:block uppercase tracking-tighter group-hover:text-cyber-cyan transition-colors italic">QAMANIOID3</h1>
           </div>
-          <div className="h-6 w-[1.5px] bg-border mx-2 hidden sm:block"></div>
-          <div className="hidden md:flex gap-1">
-             <button onClick={handleRunCode} className="flex items-center gap-2 px-3 py-1.5 text-xs font-bold text-matrix-green hover:bg-matrix-green/10 rounded transition uppercase tracking-wider">
-               <Play size={14} fill="currentColor" /> Run
-             </button>
-             <button onClick={handleShare} className="flex items-center gap-2 px-3 py-1.5 text-xs font-bold text-cosmic-blue hover:bg-cosmic-blue/10 rounded transition uppercase tracking-wider">
-               <Share2 size={14} /> {isSharing ? 'Sharing...' : 'Share'}
+          <div className="flex gap-4">
+             <button onClick={handleRunCode} className="flex items-center gap-3 px-5 py-2 text-xs font-black text-matrix-green bg-matrix-green/10 border border-matrix-green/20 rounded-xl hover:bg-matrix-green hover:text-black transition-all uppercase tracking-widest group shadow-lg">
+               <Play size={18} fill="currentColor" className="group-active:scale-90 transition-transform" /> <span className="hidden sm:inline">Initialize Logic</span>
              </button>
           </div>
         </div>
 
-        <button 
-          onClick={async () => { setIsDebugging(true); const r = await debugCode(code); setTerminalTabs(prev => {
-            const next = [...prev];
-            const idx = next.findIndex(t => t.id === activeTerminalId);
-            next[idx].history.push(`AI DEBUGGER LOG: [NEURAL_ANALYSIS_COMPLETE]`);
-            next[idx].history.push(r);
-            return next;
-          }); setIsDebugging(false); }} 
-          disabled={isDebugging}
-          className="bg-deep-purple/20 border border-deep-purple/50 text-cyber-cyan px-4 py-1.5 rounded-full font-bold text-xs flex items-center gap-3 hover:bg-deep-purple/40 transition shadow-lg shadow-deep-purple/20 disabled:opacity-50 uppercase tracking-widest"
-        >
-          <Bot size={16} className={isDebugging ? 'animate-bounce' : ''} /> {isDebugging ? 'Analyzing...' : 'AI Debug'}
-        </button>
+        <div className="flex items-center gap-4">
+           {isPyodideLoading && <div className="hidden md:flex items-center gap-2 text-muted text-[10px] animate-pulse"><Zap size={14}/> Calibrating Engine...</div>}
+           <button 
+             onClick={async () => { 
+                setIsDebugging(true); 
+                const r = await debugCode(code); 
+                addLogToActiveTerminal(`[NEURAL_ANALYSIS] for ${activeFile.name}:`);
+                addLogToActiveTerminal(r);
+                setIsDebugging(false); 
+             }} 
+             disabled={isDebugging}
+             className="bg-cosmic-blue/10 border border-cosmic-blue/30 text-cyber-cyan px-6 py-2.5 rounded-xl font-black text-xs flex items-center gap-3 hover:bg-cosmic-blue/30 transition-all shadow-xl active:scale-95 disabled:opacity-50 uppercase tracking-[0.2em]"
+           >
+             <Bot size={20} className={isDebugging ? 'animate-bounce' : ''} /> <span className="hidden md:inline">{isDebugging ? 'Analyzing Stack...' : 'Neural Scan'}</span>
+           </button>
+        </div>
       </header>
 
-      {/* --- Main Layout --- */}
+      {/* IDE Main */}
       <div className="flex-1 flex overflow-hidden">
-        {/* --- Sidebar Buttons --- */}
-        <aside className="w-16 bg-card-background border-r border-border h-full flex flex-col items-center py-6 gap-8 shrink-0 z-20">
-          <button onClick={() => setActiveSidebar('files')} title="File Explorer" className={`p-4 rounded-2xl transition-all duration-300 ${activeSidebar === 'files' ? 'bg-cosmic-blue/20 text-cyber-cyan shadow-[0_0_20px_rgba(59,130,246,0.2)]' : 'text-muted hover:text-text hover:bg-white/5'}`}>
-            <Layers size={22} />
+        {/* Sidebar Mini */}
+        <aside className="w-16 sm:w-20 bg-black/40 border-r border-white/5 h-full flex flex-col items-center py-8 gap-10 shrink-0 z-20">
+          <button onClick={() => setActiveSidebar('files')} className={`p-4 rounded-2xl transition-all duration-300 ${activeSidebar === 'files' ? 'bg-cyber-cyan/20 text-cyber-cyan shadow-[0_0_20px_rgba(34,211,238,0.2)] scale-110' : 'text-muted hover:text-text hover:bg-white/5'}`}>
+            <Layers size={platformInfo.isTouch ? 28 : 24} />
           </button>
-          <button onClick={() => setActiveSidebar('pip')} title="PIP Manager" className={`p-4 rounded-2xl transition-all duration-300 ${activeSidebar === 'pip' ? 'bg-cosmic-blue/20 text-cyber-cyan shadow-[0_0_20px_rgba(59,130,246,0.2)]' : 'text-muted hover:text-text hover:bg-white/5'}`}>
-            <Search size={22} />
+          <button onClick={() => setActiveSidebar('pip')} className={`p-4 rounded-2xl transition-all duration-300 ${activeSidebar === 'pip' ? 'bg-cyber-cyan/20 text-cyber-cyan shadow-[0_0_20px_rgba(34,211,238,0.2)] scale-110' : 'text-muted hover:text-text hover:bg-white/5'}`}>
+            <Search size={platformInfo.isTouch ? 28 : 24} />
           </button>
-          <button onClick={() => setActiveSidebar('ai')} title="AI Assistant" className={`p-4 rounded-2xl transition-all duration-300 ${activeSidebar === 'ai' ? 'bg-cosmic-blue/20 text-cyber-cyan shadow-[0_0_20px_rgba(59,130,246,0.2)]' : 'text-muted hover:text-text hover:bg-white/5'}`}>
-            <Bot size={22} />
+          <button onClick={() => setActiveSidebar('ai')} className={`p-4 rounded-2xl transition-all duration-300 ${activeSidebar === 'ai' ? 'bg-cyber-cyan/20 text-cyber-cyan shadow-[0_0_20px_rgba(34,211,238,0.2)] scale-110' : 'text-muted hover:text-text hover:bg-white/5'}`}>
+            <Bot size={platformInfo.isTouch ? 28 : 24} />
           </button>
-          <div className="mt-auto flex flex-col gap-6 mb-6">
-            <button className="text-muted hover:text-cyber-cyan transition-all transform hover:scale-110"><Globe size={20}/></button>
-            <button className="text-muted hover:text-cyber-cyan transition-all transform hover:scale-110"><Github size={20}/></button>
+          <div className="mt-auto flex flex-col gap-8 mb-8 backdrop-blur-md p-4 rounded-2xl border border-white/5">
+            <button className="text-muted hover:text-cyber-cyan transition-all transform hover:scale-125"><Globe size={22}/></button>
+            <button className="text-muted hover:text-cyber-cyan transition-all transform hover:scale-125"><Github size={22}/></button>
           </div>
         </aside>
 
-        {/* --- Sidebar Panels --- */}
+        {/* Sidebar Panel */}
         <AnimatePresence mode="wait">
           <motion.div 
-            key={activeSidebar}
-            initial={{ x: -20, opacity: 0 }}
-            animate={{ x: 0, opacity: 1 }}
+            key={activeSidebar} 
+            initial={{ x: -20, opacity: 0 }} 
+            animate={{ x: 0, opacity: 1 }} 
             exit={{ x: -20, opacity: 0 }}
-            transition={{ duration: 0.2 }}
-            className="w-72 bg-card-background border-r border-border h-full overflow-y-auto hidden lg:block shrink-0 z-10"
+            className={`w-80 bg-black/20 border-r border-white/5 h-full overflow-y-auto ${platformInfo.isTouch ? 'hidden' : 'hidden lg:block'} shrink-0 z-10 backdrop-blur-lg`}
           >
             {activeSidebar === 'files' && (
-              <div className="p-6 flex flex-col gap-8">
+              <div className="p-8 flex flex-col gap-10">
                 <div className="flex items-center justify-between">
-                  <h2 className="text-[10px] font-bold text-muted uppercase tracking-[0.3em]">Project Explorer</h2>
-                  <button className="text-muted hover:text-cyber-cyan transition-colors"><Plus size={16}/></button>
+                  <h2 className="text-xs font-black text-muted uppercase tracking-[0.5em] font-display">Sovereign Files</h2>
+                  <button className="text-muted hover:text-cyber-cyan transition-colors" onClick={async () => {
+                    const name = `script_${files.length + 1}.py`;
+                    const id = await db.files.add({ name, language: 'python', content: '' });
+                    setFiles(prev => [...prev, { id: String(id), name, language: 'python', content: '' }]);
+                    setActiveFileId(String(id));
+                  }}><Plus size={20}/></button>
                 </div>
-                <div className="text-sm space-y-2">
-                  <div className="flex items-center gap-3 p-2.5 rounded-lg bg-cosmic-blue/10 text-cyber-cyan cursor-pointer border border-cosmic-blue/20 shadow-sm"><Layers size={18}/> main.py</div>
-                  <div className="flex items-center gap-3 p-2.5 rounded-lg hover:bg-white/5 transition-all cursor-pointer text-muted group">
-                    <Layers size={18} className="group-hover:text-cyber-cyan transition-colors"/> utils.py
-                  </div>
-                  <div className="flex items-center gap-3 p-2.5 rounded-lg hover:bg-white/5 transition-all cursor-pointer text-muted group">
-                    <Code size={18} className="group-hover:text-cyber-cyan transition-colors"/> requirements.txt
-                  </div>
+                <div className="space-y-3">
+                  {files.map(f => (
+                    <div 
+                      key={f.id} 
+                      onClick={() => setActiveFileId(f.id!)}
+                      className={`flex items-center gap-4 p-4 rounded-2xl transition-all cursor-pointer border ${f.id === activeFileId ? 'bg-white/5 text-cyber-cyan border-cyber-cyan/30 shadow-xl' : 'hover:bg-white/5 text-muted border-transparent group'}`}
+                    >
+                      {f.language === 'python' ? <Layers size={20} className={f.id === activeFileId ? '' : 'group-hover:text-cyber-cyan'}/> : <Code size={20}/>}
+                      <span className="truncate flex-1 font-mono text-sm">{f.name}</span>
+                      {f.isCloned && <Zap size={14} className="text-matrix-green animate-pulse" />}
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-10 p-6 rounded-2xl bg-white/5 border border-white/5 text-[10px] text-muted leading-loose font-mono">
+                   DRAG & DROP ASSIMILATION ACTIVE. DROP FILES TO MERGE WITH SOVEREIGN CORE.
                 </div>
               </div>
             )}
             {activeSidebar === 'pip' && (
-              <div className="p-6 flex flex-col gap-8">
-                <h2 className="text-[10px] font-bold text-muted uppercase tracking-[0.2em] flex items-center gap-2"><Download size={14}/> Hyper-PIP Engine</h2>
+              <div className="p-8 flex flex-col gap-8">
+                <h2 className="text-xs font-black text-muted uppercase tracking-[0.4em] font-display">Neural Index</h2>
                 <div className="relative group">
-                  <Search size={14} className="absolute left-3 top-3 text-muted group-focus-within:text-cyber-cyan transition-colors" />
-                  <input 
-                    type="text" 
-                    placeholder="Search package index..." 
-                    className="w-full bg-background border border-border rounded-xl pl-10 pr-4 py-2.5 text-xs focus:border-cosmic-blue outline-none transition-all shadow-inner"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                  />
-                </div>
-                <div className="grid gap-4">
-                  {availablePackages.filter(p => p.name.toLowerCase().includes(searchQuery.toLowerCase())).map(lib => (
-                    <motion.div 
-                      layout
-                      key={lib.name} 
-                      className="glass-card hover:border-cosmic-blue/50 transition-all group p-4 border border-border/50 bg-black/20"
-                    >
-                      <div className="flex items-center justify-between mb-2">
-                         <span className="text-sm font-bold group-hover:text-cyber-cyan transition-colors">{lib.name}</span>
-                         <span className="text-[10px] text-muted font-mono">{lib.version}</span>
-                      </div>
-                      <p className="text-[11px] text-muted mb-4 line-clamp-2 leading-relaxed">{lib.description}</p>
-                      {installingPack === lib.name ? (
-                        <div className="space-y-2">
-                          <div className="flex justify-between text-[9px] uppercase tracking-widest text-cyber-cyan">
-                             <span>Installing...</span>
-                             <span>{progress}%</span>
-                          </div>
-                          <div className="h-1.5 w-full bg-background rounded-full overflow-hidden border border-white/5">
-                            <motion.div initial={{ width: 0 }} animate={{ width: `${progress}%` }} className="h-full bg-gradient-to-r from-cosmic-blue to-cyber-cyan shadow-[0_0_15px_#22d3ee]"/>
-                          </div>
-                        </div>
-                      ) : (
-                        <button 
-                          onClick={() => handleInstallPackage(lib.name)}
-                          className={`w-full text-[10px] uppercase font-bold py-2 rounded-lg transition-all transform active:scale-95 ${lib.installed ? 'bg-matrix-green/10 text-matrix-green border border-matrix-green/20' : 'bg-cosmic-blue text-white hover:bg-cyber-cyan hover:text-background shadow-lg shadow-cosmic-blue/20'}`}
-                        >
-                          {lib.installed ? 'Reinstall Package' : 'Install Package'}
-                        </button>
-                      )}
-                    </motion.div>
-                  ))}
+                  <Search size={16} className="absolute left-4 top-4 text-muted group-focus-within:text-cyber-cyan transition-colors" />
+                  <input type="text" placeholder="Scan cloud repository..." className="w-full bg-black/40 border border-white/10 rounded-2xl pl-12 pr-4 py-4 text-xs focus:border-cyber-cyan outline-none transition-all" />
                 </div>
               </div>
             )}
             {activeSidebar === 'ai' && (
-              <div className="p-6 flex flex-col gap-6">
-                <h2 className="text-[10px] font-bold text-muted uppercase tracking-[0.2em] flex items-center gap-2"><Bot size={14}/> Neural Assistant</h2>
-                <div className="bg-background/50 rounded-2xl p-5 border border-border relative overflow-hidden group">
-                   <div className="absolute top-0 right-0 p-2 opacity-10 group-hover:opacity-30 transition-opacity">
-                      <Bot size={40} />
-                   </div>
-                   <p className="text-xs leading-relaxed text-text relative z-10">
-                     Systems operational. Imperial neural network linked. I can analyze logic, refactor blocks, and eliminate architectural bugs.
+              <div className="p-8">
+                <h2 className="text-xs font-black text-muted uppercase tracking-[0.4em] font-display mb-8">Neural Assistant</h2>
+                <div className="bg-white/5 rounded-2xl p-6 border border-white/5 relative overflow-hidden group mb-6">
+                   <Bot size={54} className="absolute top-0 right-0 p-3 opacity-10 group-hover:opacity-30 transition-opacity" />
+                   <p className="text-xs leading-relaxed text-text relative z-10 font-mono italic">
+                     Imperial network synchronized via WASM. Active project: {activeFile.name}. Suggestions will appear in the Terminal based on mirrored patterns.
                    </p>
-                </div>
-                <div className="space-y-3">
-                   <button className="w-full py-3 text-[10px] uppercase tracking-widest font-bold border border-border rounded-xl hover:border-cyber-cyan hover:text-cyber-cyan transition-all">Optimization Log</button>
-                   <button className="w-full py-3 text-[10px] uppercase tracking-widest font-bold border border-border rounded-xl hover:border-cyber-cyan hover:text-cyber-cyan transition-all">Refactor History</button>
                 </div>
               </div>
             )}
           </motion.div>
         </AnimatePresence>
 
-        {/* --- Editor & Terminal Area --- */}
+        {/* Editor Area */}
         <main className="flex-1 flex flex-col overflow-hidden relative">
-          {/* --- Editor Area --- */}
-          <div className="flex-1 overflow-hidden relative border-b border-border bg-[#0a0a0c]">
-            <div className="h-10 bg-card-background/30 border-b border-border flex items-center px-6 gap-6 text-[11px] font-mono tracking-wider">
-               <div className="flex items-center gap-2 text-cyber-cyan border-b-2 border-cyber-cyan h-full px-3">
-                 <div className="w-1.5 h-1.5 rounded-full bg-cyber-cyan shadow-[0_0_5px_#22d3ee]"></div>
-                 main.py
-               </div>
-               <span className="text-muted hover:text-text transition-colors cursor-pointer px-3">utils.py</span>
-               <span className="text-muted hover:text-text transition-colors cursor-pointer px-3">env.py</span>
-            </div>
-            <Editor
-              height="calc(100% - 40px)"
-              defaultLanguage="python"
-              theme="vs-dark"
-              value={code}
-              onChange={(v) => v !== undefined && setCode(v)}
-              options={{
-                fontFamily: "'JetBrains Mono', monospace",
-                fontSize: 16,
-                minimap: { enabled: true, side: 'right' },
-                automaticLayout: true,
-                formatOnType: true,
-                cursorBlinking: 'smooth',
-                lineHeight: 28,
-                padding: { top: 20 },
-                scrollbar: {
-                  verticalSliderSize: 5,
-                  horizontalSliderSize: 5,
-                }
-              }}
-            />
+          <div className="flex-1 flex flex-col overflow-hidden bg-[#0a0a0c]">
+             {/* Dynamic Tab Bar */}
+             <div className="h-12 bg-black/40 border-b border-white/5 flex items-center px-4 gap-2 overflow-x-auto scrollbar-hide shrink-0">
+                {files.map(f => (
+                  <div 
+                    key={f.id}
+                    onClick={() => setActiveFileId(f.id!)}
+                    className={`flex items-center gap-3 h-full px-6 shrink-0 transition-opacity cursor-pointer border-b-2 font-mono text-xs ${f.id === activeFileId ? 'text-cyber-cyan border-cyber-cyan bg-white/5' : 'text-muted border-transparent hover:text-text'}`}
+                  >
+                    {f.id === activeFileId && <div className="w-2 h-2 rounded-full bg-cyber-cyan shadow-[0_0_10px_#22d3ee] animate-pulse"></div>}
+                    {f.name}
+                    {f.isCloned && <Zap size={10} className="text-matrix-green" />}
+                  </div>
+                ))}
+             </div>
+             
+             <div className="flex-1 relative">
+                <Editor
+                  height="100%"
+                  language={activeFile.language}
+                  theme="vs-dark"
+                  value={code}
+                  beforeMount={handleEditorWillMount}
+                  onChange={(v) => v !== undefined && setCode(v)}
+                  options={{
+                    fontFamily: activeFile.language === 'qamani' ? "'IBM Plex Sans Arabic', monospace" : "'JetBrains Mono', monospace",
+                    fontSize: platformInfo.isTouch ? 18 : 16,
+                    minimap: { enabled: !platformInfo.isTouch, side: 'right' },
+                    cursorBlinking: 'smooth',
+                    lineHeight: platformInfo.isTouch ? 36 : 28,
+                    padding: { top: 30 },
+                    scrollbar: { verticalSliderSize: 8, horizontalSliderSize: 8 },
+                    wordWrap: 'on',
+                    smoothScrolling: true,
+                    mouseWheelZoom: true
+                  }}
+                />
+             </div>
+
+             {platformInfo.isTouch && !isKeyboardVisible && <KeyboardToolbar onInsert={(s) => setCode(p => p + s)} />}
           </div>
 
-          <KeyboardToolbar onInsert={insertCodeSymbol} />
-
-          {/* --- Hyper-Terminal --- */}
+          {/* Hyper-Terminal */}
           <motion.div 
             initial={false}
-            animate={{ height: stage === 'ide' ? 260 : 0 }}
-            className="bg-[#050507] flex flex-col overflow-hidden relative group border-t border-border"
+            animate={{ height: platformInfo.isTouch ? (isKeyboardVisible ? 0 : 250) : 320 }}
+            className="bg-[#050507] border-t border-white/5 relative flex flex-col overflow-hidden group"
           >
             <div className="terminal-scanline"></div>
-            {/* Terminal Tabs */}
-            <div className="flex bg-black/60 border-b border-border/30 overflow-x-auto shrink-0 scrollbar-hide h-12">
-               {terminalTabs.map(tab => (
-                 <div 
-                   key={tab.id} 
-                   onClick={() => setActiveTerminalId(tab.id)}
-                   className={`px-6 h-full text-[10px] uppercase font-bold tracking-[0.2em] flex items-center gap-3 cursor-pointer transition-all border-r border-border/20 min-w-[150px] relative ${activeTerminalId === tab.id ? 'bg-matrix-green/5 text-matrix-green after:content-[""] after:absolute after:bottom-0 after:left-0 after:w-full after:h-[2px] after:bg-matrix-green' : 'text-muted hover:bg-white/5'}`}
-                 >
-                   <TerminalIcon size={14} className={activeTerminalId === tab.id ? 'animate-pulse' : ''} /> {tab.title}
-                   <X size={14} className="ml-auto hover:text-red-500 opacity-20 group-hover:opacity-100 transition-opacity" onClick={(e) => removeTerminalTab(tab.id, e)} />
-                 </div>
-               ))}
-               <button onClick={addTerminalTab} className="px-4 text-muted hover:text-matrix-green transition-colors border-r border-border/20"><Plus size={18}/></button>
-               <div className="ml-auto flex items-center px-6 gap-6 text-[10px] font-mono uppercase tracking-[0.2em] text-muted/50">
-                  <div className="flex items-center gap-2">
-                    <div className="w-1.5 h-1.5 rounded-full bg-matrix-green animate-pulse"></div>
-                    CLI Online
-                  </div>
-                  <span>SESSION_ID: {activeTerminalId.split('-')[1] || '0XF1'}</span>
+            <div className="flex h-12 border-b border-white/5 bg-black/40 shrink-0">
+               <div className="px-8 h-full flex items-center gap-4 text-matrix-green text-[10px] font-black uppercase tracking-[0.4em] bg-matrix-green/5">
+                 <TerminalIcon size={16} className="animate-pulse" /> bash core
                </div>
             </div>
 
-            {/* Terminal Content Area with AnimatePresence for smooth transitions */}
-            <div className="flex-1 p-6 font-mono text-xs overflow-y-auto scrollbar-thin scrollbar-thumb-matrix-green/10">
-               <AnimatePresence mode="popLayout" initial={false}>
-                 <motion.div 
-                   key={activeTerminalId}
-                   initial={{ opacity: 0, y: 10 }}
-                   animate={{ opacity: 1, y: 0 }}
-                   exit={{ opacity: 0, y: -10 }}
-                   transition={{ duration: 0.2 }}
-                 >
-                   {terminalTabs.find(t => t.id === activeTerminalId)?.history.map((line, i) => (
-                     <div 
-                       key={i} 
-                       className={`mb-1.5 leading-relaxed tracking-wide ${
-                         line.startsWith('$') ? 'text-matrix-green font-bold' : 
-                         line.startsWith('AI') ? 'text-cyber-cyan italic border-l-2 border-cyber-cyan/30 pl-3 my-2' : 
-                         'text-text/70'
-                       }`}
-                     >
-                       {line}
-                     </div>
-                   ))}
-                 </motion.div>
-               </AnimatePresence>
-               <div ref={terminalBottomRef} />
+            <div className={`flex-1 p-8 font-mono overflow-y-auto scrollbar-thin scrollbar-thumb-white/5 ${platformInfo.isTouch ? 'text-[11px]' : 'text-sm'}`}>
+              <AnimatePresence mode="popLayout" initial={false}>
+                 {terminalTabs[0].history.map((line, i) => (
+                   <div key={i} className={`mb-3 leading-relaxed ${line.startsWith('$') ? 'text-matrix-green font-black' : line.startsWith('[MIRROR') || line.startsWith('[NEURAL') ? 'text-cyber-cyan italic border-l-4 border-cyber-cyan/40 pl-6 my-6 bg-cyber-cyan/5 py-4 rounded-xl' : 'text-text/80'}`}>
+                     {line}
+                   </div>
+                 ))}
+              </AnimatePresence>
+              <div ref={terminalBottomRef} />
             </div>
 
-            {/* Terminal Input Bar */}
-            <div className="h-12 border-t border-border/20 bg-black/80 flex items-center px-6 gap-4 shrink-0 shadow-[0_-10px_20px_rgba(0,0,0,0.5)]">
-               <span className="text-matrix-green font-bold select-none tracking-widest">{" >>> "}</span>
+            <div className="h-16 border-t border-white/5 bg-black/80 flex items-center px-8 gap-6 shrink-0 shadow-2xl">
+               <span className="text-matrix-green font-black text-lg select-none tracking-widest italic">{" >>> "}</span>
                <input 
                  type="text" 
-                 className="flex-1 bg-transparent border-none outline-none text-matrix-green font-mono text-xs caret-matrix-green placeholder:text-matrix-green/20"
+                 className="flex-1 bg-transparent border-none outline-none text-matrix-green font-mono text-sm caret-matrix-green placeholder:text-matrix-green/20"
                  value={terminalInput}
                  onChange={(e) => setTerminalInput(e.target.value)}
                  onKeyDown={(e) => e.key === 'Enter' && executeTerminalCommand(terminalInput)}
-                 autoFocus
-                 placeholder="Execute command..."
+                 placeholder="Communicate with Sovereign OS..."
                />
                <div className="flex gap-4">
-                 <button onClick={() => executeTerminalCommand('ls')} className="text-[9px] uppercase font-bold text-muted hover:text-matrix-green transition-colors tracking-widest border border-border/30 px-3 py-1 rounded hover:border-matrix-green/50">List</button>
-                 <button onClick={handleRunCode} className="text-[9px] uppercase font-bold text-muted hover:text-matrix-green transition-colors tracking-widest border border-border/30 px-3 py-1 rounded hover:border-matrix-green/50">Run_Script</button>
+                 <button onClick={() => executeTerminalCommand('ls')} className="px-6 py-2 bg-white/5 border border-white/10 rounded-xl text-[10px] font-black uppercase tracking-widest hover:text-matrix-green hover:border-matrix-green transition-all shadow-lg active:scale-95">ls</button>
+                 <button onClick={handleRunCode} className="px-6 py-2 bg-matrix-green/10 border border-matrix-green/20 rounded-xl text-[10px] font-black uppercase tracking-widest text-matrix-green hover:bg-matrix-green hover:text-black transition-all shadow-lg active:scale-95">run</button>
                </div>
             </div>
           </motion.div>
