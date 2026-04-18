@@ -1,0 +1,50 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", sans-serif;
+  --font-mono: "JetBrains Mono", sans-serif;
+  --font-display: "Space Grotesk", sans-serif;
+  
+  /* QAMANIOID3 Palette */
+  --color-background: #0a0a0c;
+  --color-card-background: #16161a;
+  --color-deep-purple: #4c1d95;
+  --color-cosmic-blue: #3b82f6; 
+  --color-cyber-cyan: #22d3ee;
+  --color-matrix-green: #00ff41;
+  
+  --color-text: #f1f1f1;
+  --color-muted: #94a3b8;
+  --color-border: rgba(255,255,255,0.1);
+}
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+}
+
+.glass-card {
+  background-color: var(--color-card-background);
+  border: 1px solid var(--color-border);
+  padding: 1rem;
+  border-radius: 0.5rem;
+}
+
+@keyframes scanline {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100%); }
+}
+
+.terminal-scanline {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 100%;
+  background: linear-gradient(to bottom, transparent, rgba(0, 255, 65, 0.05) 50%, transparent);
+  animation: scanline 8s linear infinite;
+  pointer-events: none;
+}
+
